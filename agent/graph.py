@@ -62,6 +62,9 @@ def llm() -> ChatOpenAI:
         base_url=VLLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.0,
+        # SQL queries and the verify JSON are short; cap output so a runaway
+        # generation can't decode thousands of tokens and hog an agent thread.
+        max_tokens=256,
     )
 
 
