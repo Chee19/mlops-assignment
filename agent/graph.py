@@ -16,6 +16,7 @@ conditional router following the same shape.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -124,7 +125,50 @@ def verify_node(state: AgentState) -> dict:
     What counts as "not plausible" is yours to define - see the Phase 3 targets
     in the README.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    result = state.execution.render() if state.execution else "NO EXECUTION RESULT"
+    response = llm().invoke([
+        ("system", prompts.VERIFY_SYSTEM),
+        ("user", prompts.VERIFY_USER.format(
+            question=state.question,
+            sql=state.sql,
+            result=result,
+        )),
+    ])
+    ok, issue = _parse_verdict(response.content)
+    return {
+        "verify_ok": ok,
+        "verify_issue": issue,
+        "history": state.history + [{"node": "verify", "ok": ok, "issue": issue}],
+    }
+
+
+def _parse_verdict(text: str) -> tuple[bool, str]:
+    """Extract {"ok": bool, "issue": str} from a possibly messy LLM reply.
+
+    Fail-open: an unparseable verdict ends the loop rather than burning
+    revise iterations on garbage feedback.
+    """
+    candidate = re.search(r"\{.*\}", text, re.DOTALL)
+    if candidate:
+        try:
+            verdict = json.loads(candidate.group(0))
+            ok = _coerce_ok(verdict.get("ok", True))
+            return ok, str(verdict.get("issue", "") or "")
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+    return True, ""
+
+
+def _coerce_ok(value: Any) -> bool:
+    """Interpret the verdict's `ok` field, honoring stringified booleans.
+
+    A model that emits {"ok": "false"} must not be read as True (bool("false")
+    is truthy in Python), which would silently skip a revise. Only a genuinely
+    absent/unparseable verdict fails open (handled by the caller's default).
+    """
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "no", "0", ""}
+    return bool(value)
 
 
 def revise_node(state: AgentState) -> dict:
@@ -137,7 +181,23 @@ def revise_node(state: AgentState) -> dict:
 
     Return: {"sql": <str>, "iteration": state.iteration + 1, ...}.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    result = state.execution.render() if state.execution else "NO EXECUTION RESULT"
+    response = llm().invoke([
+        ("system", prompts.REVISE_SYSTEM),
+        ("user", prompts.REVISE_USER.format(
+            schema=state.schema,
+            question=state.question,
+            sql=state.sql,
+            result=result,
+            issue=state.verify_issue or "result did not plausibly answer the question",
+        )),
+    ])
+    sql = _extract_sql(response.content)
+    return {
+        "sql": sql,
+        "iteration": state.iteration + 1,
+        "history": state.history + [{"node": "revise", "sql": sql}],
+    }
 
 
 def route_after_verify(state: AgentState) -> str:
@@ -146,7 +206,9 @@ def route_after_verify(state: AgentState) -> str:
     Two reasons to end: the verifier was happy (state.verify_ok), or you've hit
     the iteration cap (state.iteration >= MAX_ITERATIONS). Otherwise, revise.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    if state.verify_ok or state.iteration >= MAX_ITERATIONS:
+        return "end"
+    return "revise"
 
 
 # ---- Graph wiring -----------------------------------------------------

@@ -58,7 +58,47 @@ def matches(gold_rows: list[tuple] | None, pred_rows: list[tuple] | None) -> boo
 
 def eval_one(question: dict, agent_url: str) -> dict:
     """Score one question. Return a dict capturing per-iteration correctness."""
-    raise NotImplementedError("Phase 5")
+    db_id = question["db_id"]
+    gold_ok, gold_rows, gold_err = run_sql(db_id, question["gold_sql"])
+
+    t0 = time.monotonic()
+    try:
+        resp = httpx.post(
+            agent_url,
+            json={"question": question["question"], "db": db_id},
+            timeout=120.0,
+        )
+        resp.raise_for_status()
+        answer = resp.json()
+        agent_err = None
+    except Exception as e:  # noqa: BLE001
+        answer = {}
+        agent_err = f"{type(e).__name__}: {e}"
+    latency = time.monotonic() - t0
+
+    # Re-execute every SQL attempt: "had we stopped here, would it be right?"
+    attempts = [
+        h["sql"] for h in answer.get("history", [])
+        if h.get("node") in ("generate_sql", "revise")
+    ]
+    iteration_correct: list[bool] = []
+    for sql in attempts:
+        ok, rows, _ = run_sql(db_id, sql)
+        iteration_correct.append(gold_ok and ok and matches(gold_rows, rows))
+
+    return {
+        "question": question["question"],
+        "db_id": db_id,
+        "gold_sql": question["gold_sql"],
+        "gold_error": gold_err,
+        "final_sql": answer.get("sql", ""),
+        "iterations": answer.get("iterations", 0),
+        "agent_ok": answer.get("ok", False),
+        "agent_error": agent_err or answer.get("error"),
+        "latency_seconds": latency,
+        "iteration_correct": iteration_correct,
+        "correct": iteration_correct[-1] if iteration_correct else False,
+    }
 
 
 def summarize(results: list[dict]) -> dict:
@@ -70,7 +110,30 @@ def summarize(results: list[dict]) -> dict:
     The agent stopped emitting; whatever it had at termination is what
     would have been served had we polled at iteration k.
     """
-    raise NotImplementedError("Phase 5")
+    n = len(results)
+    max_iters = max((len(r["iteration_correct"]) for r in results), default=0)
+
+    pass_at_iteration: list[float] = []
+    for k in range(max_iters):
+        correct_at_k = 0
+        for r in results:
+            ic = r["iteration_correct"]
+            if not ic:
+                continue
+            # carry-forward: terminated runs keep their last result
+            correct_at_k += ic[min(k, len(ic) - 1)]
+        pass_at_iteration.append(correct_at_k / n if n else 0.0)
+
+    return {
+        "total_questions": n,
+        "correct": sum(r["correct"] for r in results),
+        "pass_rate": (sum(r["correct"] for r in results) / n) if n else 0.0,
+        "pass_rate_at_iteration": pass_at_iteration,
+        "avg_iterations": (sum(r["iterations"] for r in results) / n) if n else 0.0,
+        "revise_triggered": sum(1 for r in results if len(r["iteration_correct"]) > 1),
+        "agent_errors": sum(1 for r in results if r["agent_error"]),
+        "avg_latency_seconds": (sum(r["latency_seconds"] for r in results) / n) if n else 0.0,
+    }
 
 
 # ---------- Main (provided) --------------------------------------------
