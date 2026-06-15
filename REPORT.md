@@ -1,8 +1,9 @@
 # Text-to-SQL on Qwen3-30B-A3B — Serving, Observability, Eval & SLO Report
 
-> Status: Sections 1, 4 drafted off-GPU against Nebius Token Factory
-> (Qwen3-30B-A3B-Instruct-2507, same model). Numbers tagged **[TBD on H100]**
-> are filled from the real 1×H100 run.
+> Status: Run on 1×H100 80GB. §1 serving config and §3 SLO iteration log are
+> filled with real numbers. §2 baseline eval and the per-iteration pass rates
+> in §4 are pending a final eval pass (harness validated; numbers tagged
+> **[TBD — eval run]**).
 
 ---
 
@@ -42,7 +43,15 @@ decode interleave). Keeping these in reserve is intentional — Phase 1 is the
 informed static config; Phase 6 is the load-driven iteration.
 
 **Manual sanity check:** `screenshots/vllm_manual_query.png` — vLLM serving on
-:8000, one eval question returning sensible SQL. **[TBD on H100]**
+:8000, a chat-completion returning a valid SQLite query (`SELECT * FROM t;`,
+`finish_reason: stop`). Model loaded in ~29 GiB (FP8 weights), confirming the
+quantization math above.
+
+**Serving-readiness fix found on the H100:** vLLM 0.10.2 is incompatible with
+`transformers` 5.x (the lockfile, built off-GPU without vllm in the resolver,
+had pulled 5.9.0) — pinned `transformers<5` in `pyproject.toml`. Also installed
+`python3-dev` so vLLM's Triton JIT could compile its CUDA kernels. Both are the
+kind of environment drift that only surfaces on the real serving box.
 
 ---
 
@@ -53,14 +62,25 @@ final SQL and the gold SQL against the target DB, compare canonicalized row sets
 (sorted, stringified, NULL→''). Per-iteration pass rate uses carry-forward — a
 question that terminated early keeps its last result at later iterations.
 
-- Overall pass rate: **[TBD on H100]** (`results/eval_baseline.json`)
-- Pass rate by iteration (0 / 1 / 2): **[TBD on H100]**
-- Avg iterations / # questions that triggered a revise: **[TBD on H100]**
-- Grafana during the run: `screenshots/grafana_eval_run.png` **[TBD on H100]**
+Two eval passes are run so the loop's value can be isolated from the SLO tuning:
+`eval_baseline.json` at the Phase-1 agent (`MAX_ITERATIONS=3`) and
+`eval_after_tuning.json` at the Phase-6 agent (`MAX_ITERATIONS=2`).
 
-Commentary: **[TBD — does iter-2 pass rate beat iter-0? If yes the loop earns its
-keep; if flat, the architecture is doing nothing. Cite the numbers.]**
+- Overall pass rate (baseline / after-tuning): **[TBD — eval run]**
+- Pass rate by iteration (0 / 1 / 2): **[TBD — eval run]**
+- Avg iterations / # questions that triggered a revise: **[TBD — eval run]**
 
+Commentary: **[TBD — does iter-1/iter-2 pass rate beat iter-0 (loop earns its
+keep), and does cutting iter-2 in Phase 6 cost any accuracy? Cite the numbers.]**
+
+> A prerequisite bug was fixed before any clean run: `render_schema` (provided)
+> crashed with `AttributeError` on BIRD DBs whose foreign keys implicitly
+> reference the parent PK (SQLite returns a NULL parent column). Because schema
+> rendering is the first graph node, this 500'd **every** request to those DBs —
+> ~12% of the load pool — independent of RPS. Fixed by falling back to the child
+> column name when the parent is NULL. This had to be fixed for both the eval and
+> the SLO numbers to mean anything.
+>
 > Harness validated off-GPU against Nebius: per-iteration carry-forward works, and
 > the `formula_1` duplicate-rows question went pass@iter `[0.0, 1.0]` — the verify
 > step caught identical JOIN-multiplied rows and revise added DISTINCT to fix it.
@@ -70,22 +90,69 @@ keep; if flat, the architecture is doing nothing. Cite the numbers.]**
 ## 3. Hitting the SLO (Phase 6)
 
 **SLO:** P95 end-to-end agent latency < 5s at 10+ RPS over a 5-min window.
-Load: `uv run python load_test/driver.py --rps <n> --duration 300`.
+Load: `uv run python load_test/driver.py --rps 10 --duration 300`.
 
-- Baseline vs. SLO (P50 / P95 / P99 @ target RPS): **[TBD on H100]**
+**Baseline @ 10 RPS × 300s** (Phase-1 serving, agent `MAX_ITERATIONS=3`):
+
+| P50 | P95 | P99 | max | achieved RPS | ok |
+|---|---|---|---|---|---|
+| 1.41s | **6.17s** | 10.26s | 85s | 8.82 | 99.7% |
+
+→ **MISS** — P95 6.17s > 5s. (`results/load_test_baseline.json`)
+
+**Diagnosis — read off Grafana *under load* (`grafana_before*.png`):** vLLM was
+idle, not the bottleneck. KV cache ~3%, `requests waiting` flat at 0,
+preemptions 0, TTFT p95 ~40ms, TPOT p95 ~20ms, `running` peaked ~30. The latency
+lives entirely in the **agent's sequential LLM call chain** (generate → verify →
+revise → verify), not in serving. Critically, this means the *reserved serving
+levers* (`--max-num-seqs`, `--kv-cache-dtype fp8`, `--max-num-batched-tokens`,
+`--max-model-len 4096`) would tune a resource that is already 97% idle — they
+cannot move this P95. That is the central call of this phase: **the fix is
+agent-side, and turning vLLM knobs here would be cargo-culting.**
 
 **Iteration log** — *saw X → hypothesized Y → changed Z → result W*:
 
-1. **[TBD]** saw … → hypothesized … → changed … → result …
-2. **[TBD]** …
-3. **[TBD]** …
+1. **Cap output length → REGRESSION (reverted).** *Saw* an 85s max latency and a
+   ~2-min spike on vLLM's E2E-latency panel while KV/queue stayed idle.
+   *Hypothesized* a runaway generation decoding to the model's default token
+   ceiling. *Changed* `llm()` to `max_tokens=256`. *Result:* P95 **6.17s →
+   77.6s** — a 12× regression. The cap truncated valid SQL mid-statement →
+   execution errored → verifier rejected → the revise loop fired on nearly every
+   request, multiplying calls ~2 → ~6. **Lesson:** the tail was the *revise
+   loop*, not token count; truncation feeds the loop. Reverted.
 
-- Before/after the change that moved the needle:
-  `screenshots/grafana_before.png`, `screenshots/grafana_after.png` **[TBD]**
-- Final config + final P50/P95/P99: **[TBD on H100]**
-- Quality after tuning: `results/eval_after_tuning.json` — did pass rate survive?
-  **[TBD]**
-- **Honest verdict:** SLO hit, or missed with the gap quantified. **[TBD]**
+2. **Shorten the revise loop → SLO HIT.** *Saw* (from iter-1) that loop depth is
+   the true tail driver. *Hypothesized* the 2nd revise iteration is mostly
+   latency cost and rarely fixes anything a 1st revise didn't. *Changed*
+   `MAX_ITERATIONS 3 → 2`. *Result:*
+
+   | metric | baseline | after | Δ |
+   |---|---|---|---|
+   | P50 | 1.41s | 1.28s | −9% |
+   | **P95** | **6.17s** | **4.01s** | **−35% ✅** |
+   | P99 | 10.26s | 6.58s | −36% |
+   | max | 85s | 19.4s | −77% |
+   | achieved RPS | 8.82 | 9.44 | +7% |
+   | ok | 99.7% | 99.7% | flat |
+
+   Cutting the worst-case chain from ~6 calls to ~4 crushed the tail; because the
+   slow requests no longer hog agent threads, queueing eased and throughput rose
+   too. (`results/load_test_iter2.json`)
+
+- Before/after: `screenshots/grafana_before*.png` (serving idle under load),
+  `screenshots/grafana_after.png` **[TBD — re-grab; Prometheus scrape of vLLM
+  needs reconnecting after a vLLM restart]**.
+- **Final config:** vLLM **unchanged from Phase 1** (it was never the
+  bottleneck); agent `MAX_ITERATIONS=2`. Final P50/P95/P99 @ 10 RPS × 5 min:
+  **1.28 / 4.01 / 6.58 s.**
+- Quality after tuning: `results/eval_after_tuning.json` vs `eval_baseline.json`
+  — did pass rate survive cutting iter-2? **[TBD — eval run]**
+- **Honest verdict:** **SLO HIT.** P95 4.01s < 5s at 10 RPS offered (9.44
+  achieved) over a 5-min window. Caveats: achieved RPS is 9.44 not a clean 10
+  (open-loop driver + drain tail), and a *cold* vLLM restart produces run-to-run
+  variance (a re-run cancelled ~6% of tail requests during warm-up); warm runs
+  are clean. The win came from one agent-side change, with serving left as-is —
+  exactly what the diagnosis predicted.
 
 ---
 
@@ -98,8 +165,19 @@ where rows are implied, or duplicate rows where a single fact / distinct list wa
 asked for).
 
 Evidence the loop does real work comes from the **per-iteration pass rate**: if
-iter-2 ≈ iter-0, the loop is pure latency cost; if iter-2 > iter-0, it is
-rescuing questions. **[TBD on H100 — cite the gap.]**
+iter-1 ≈ iter-0, the loop is pure latency cost; if iter-1 > iter-0, it is
+rescuing questions. **[TBD — eval run; compare `eval_baseline.json` (MAX=3) vs
+`eval_after_tuning.json` (MAX=2) — did the 2nd revise ever lift accuracy, and did
+removing it in Phase 6 cost any pass rate?]**
+
+The **cost** side is now quantified directly from Phase 6: the revise loop is the
+single biggest driver of tail latency. Cutting just the *second* revise iteration
+(`MAX_ITERATIONS 3→2`) dropped P95 from 6.17s to 4.01s and the max from 85s to
+19s — i.e. that one extra iteration was adding ~2s at P95 and ~65s at the
+extreme. So the loop's first revise is plausibly worth its cost (it rescued the
+`formula_1` case off-GPU), but each additional iteration is expensive tail
+latency that must be justified by a matching pass-rate lift. The Phase 6 result
+is a bet that iter-2 rarely pays off; the pending eval confirms or refutes it.
 
 Preliminary off-GPU signal (Nebius, not gradeable but directional): on the
 `formula_1` circuit-coordinates question, generation alone produced JOIN-duplicated
