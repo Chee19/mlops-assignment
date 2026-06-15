@@ -30,8 +30,11 @@ from agent.execution import ExecutionResult, execute_sql
 from agent.schema import render_schema
 
 # Total generate + revise calls before the loop is forced to stop.
-# 3-5 is a reasonable range; tune it as part of Phase 3.
-MAX_ITERATIONS = 3
+# Phase 6: lowered 3->2. At MAX=3 the tail requests chained up to 6 LLM
+# calls (3 generate/revise + 3 verify), dominating p95/p99 while vLLM sat
+# idle. One revise rescues most fixable queries; a 2nd rarely helps and
+# its latency cost is not worth it under the SLO.
+MAX_ITERATIONS = 2
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
@@ -62,9 +65,6 @@ def llm() -> ChatOpenAI:
         base_url=VLLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.0,
-        # SQL queries and the verify JSON are short; cap output so a runaway
-        # generation can't decode thousands of tokens and hog an agent thread.
-        max_tokens=256,
     )
 
 
